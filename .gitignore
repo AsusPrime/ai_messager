@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtualenv / uv
+.venv/
+uv.lock
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Project
+.env
+.env.local
+
+# Local tooling state (Claude Code, code-review-graph)
+.claude/
+.code-review-graph/
