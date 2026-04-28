@@ -1,0 +1,19 @@
+# Copy this file to ~/.ai_messager/config.yaml and edit.
+# Each endpoint becomes an MCP tool named "ask_<endpoint.name>" that Claude can call.
+
+endpoints:
+  - name: gpt_architect
+    provider: chatgpt_web
+    # Pin to an existing chat that already has project memory.
+    # Replace with the URL of your actual chat.
+    chat_url: https://chatgpt.com/c/REPLACE-ME
+    description: >
+      Senior architect with full project memory. Ask when you need
+      architecture decisions, design review, or tradeoff analysis.
+
+  - name: gpt_fresh
+    provider: chatgpt_web
+    # Omit chat_url to start a fresh chat every call (zero memory).
+    description: >
+      Stateless GPT. Use for one-off lookups, translations, anything
+      where contamination between calls is undesirable.
