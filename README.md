@@ -1,5 +1,13 @@
 # ai-messager
 
+> **⚠️ HEADS UP — THIS IS AN MVP WRITTEN BY AN AGENT.**
+>
+> **THE CODE WILL BE REWRITTEN AND EXTENDED. NEW LLM PROVIDERS, NEW
+> FEATURES, AND BETTER ABSTRACTIONS ARE COMING.**
+>
+> **THE PROJECT IS OPEN TO MODIFICATIONS — PRs, ISSUES, AND IDEAS ARE
+> VERY WELCOME. ANY HELP WILL BE HUGELY APPRECIATED.**
+
 Local MCP server that lets Claude (CLI/Desktop) talk to web-based LLM chats
 (ChatGPT, Gemini, DeepSeek, ...) as if they were tools. Uses Playwright with a
 persistent browser profile — no API keys, no cookie copying, just a one-time
