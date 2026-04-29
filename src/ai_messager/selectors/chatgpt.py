@@ -62,7 +62,20 @@ class ChatGPTSelectors:
 
     @staticmethod
     def turn_action_button(turn: Locator) -> Locator:
-        # Per-turn buttons (Copy / Good response / Try again / etc.) are
-        # deferred-rendered AFTER ChatGPT finishes streaming the turn —
-        # their appearance is the most reliable end-of-generation signal.
-        return turn.locator('[data-testid$="-turn-action-button"]').first
+        # Per-turn buttons (Copy / Good response / Bad response / ...) are
+        # deferred-rendered AFTER ChatGPT finishes streaming — their
+        # appearance is the most reliable end-of-generation signal.
+        #
+        # ChatGPT now mounts these buttons inside the parent
+        # <section data-testid="conversation-turn-N"> as a sibling subtree
+        # of the [data-message-author-role="assistant"] div we anchor
+        # `turn` to, NOT as descendants of it. Walk up to the nearest
+        # conversation-turn ancestor (or `turn` itself if it already is
+        # one), then search descendants for the buttons.
+        return (
+            turn.locator(
+                'xpath=ancestor-or-self::*[starts-with(@data-testid,"conversation-turn-")][1]'
+            )
+            .locator('[data-testid$="-turn-action-button"]')
+            .first
+        )

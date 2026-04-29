@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Locator, Page
+from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from ai_messager.bridges.base import LLMBridge
@@ -112,12 +112,13 @@ class ChatGPTBridge(LLMBridge):
                     stage="composer_visible",
                 ) from exc
 
-            # Snapshot the current turn count so we can tell when a new one
-            # arrives. Relying on "stop-button disappears" is unreliable: the
-            # button can flash between streaming frames and the hidden-state
-            # wait can return early, giving us partial text like "Result l".
-            assistant_turns = ChatGPTSelectors.assistant_turns(page)
-            turns_before = await assistant_turns.count()
+            # ChatGPT virtualizes the chat list — old turns mount/unmount
+            # as we interact, so anchoring to a specific assistant turn by
+            # id or index is unreliable. Instead we operate on page-level
+            # invariants: snapshot the current "last assistant turn text"
+            # before sending and watch for it to (a) change, then (b)
+            # stabilize, in concert with the stop-button visibility cycle.
+            text_before_send = await self._last_assistant_text(page)
 
             # ChatGPT's composer is a ProseMirror contenteditable, not a plain
             # textarea. Locator.fill() bypasses ProseMirror's input handlers,
@@ -140,27 +141,10 @@ class ChatGPTBridge(LLMBridge):
             except PlaywrightTimeoutError:
                 await composer.press("Enter")
 
-            # Wait for a brand-new assistant turn to be appended.
             try:
-                await page.wait_for_function(
-                    "count => document.querySelectorAll("
-                    "'[data-message-author-role=\"assistant\"]'"
-                    ").length > count",
-                    arg=turns_before,
-                    timeout=ui_timeout,
+                text = await self._wait_for_response(
+                    page, text_before_send=text_before_send
                 )
-            except PlaywrightTimeoutError as exc:
-                await self._capture_debug_artifact(page, "generation_start")
-                raise LLMResponseTimeout(
-                    self.provider_name,
-                    ui_timeout // 1000,
-                    stage="generation_start",
-                ) from exc
-
-            new_turn = assistant_turns.nth(turns_before)
-
-            try:
-                text = await self._wait_for_stream_end(new_turn)
             except PlaywrightTimeoutError as exc:
                 await self._capture_debug_artifact(page, "generation_end")
                 raise LLMResponseTimeout(
@@ -171,82 +155,100 @@ class ChatGPTBridge(LLMBridge):
 
             return text.strip()
 
-    async def _wait_for_stream_end(self, turn: Locator) -> str:
-        """Wait until generation finishes; return final turn text.
+    async def _wait_for_response(self, page: Page, *, text_before_send: str) -> str:
+        """Wait until the assistant has produced a stable new response.
 
-        Two signals race; the first to succeed wins:
-          - Primary: a per-turn action button (Copy / Good response / etc.)
-            mounts inside the turn — ChatGPT only renders those AFTER
-            streaming ends. Robust against mid-stream pauses (reasoning
-            models, multi-phase replies) that broke the old text-stability
-            heuristic.
-          - Fallback: turn text stays unchanged for stream_stable_ms.
-            Survives a testid rename until selectors are patched.
-        Both share response_timeout_s as the deadline. Raises
-        PlaywrightTimeoutError if neither fires in time.
+        Operates on page-level state to avoid anchoring to a specific
+        assistant-turn DOM node — ChatGPT virtualizes the chat list and
+        any specific turn can mount/unmount mid-stream.
+
+        Two debounced signals race; the first to fire returns the text
+        of the last assistant turn at that moment:
+          - text_changed_then_stable: the last assistant turn's text
+            differs from `text_before_send` (i.e. a new response began)
+            AND has been unchanged for stream_stable_ms.
+          - stop_button_present_then_gone: the stop-button has been
+            seen present (streaming started) and then continuously
+            absent for stream_stable_ms.
+        Bounded by response_timeout_s. On timeout raises PlaywrightTimeoutError.
         """
-        primary = asyncio.create_task(self._wait_for_action_button(turn))
-        fallback = asyncio.create_task(self._wait_for_text_stable(turn))
-        pending: set[asyncio.Task[None]] = {primary, fallback}
-        last_exc: BaseException | None = None
-
-        try:
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    exc = task.exception()
-                    if exc is None:
-                        return (await turn.inner_text()).strip()
-                    last_exc = exc
-        finally:
-            for task in pending:
-                task.cancel()
-
-        assert last_exc is not None
-        raise last_exc
-
-    async def _wait_for_action_button(self, turn: Locator) -> None:
-        # state="attached" — not "visible". The buttons mount in the DOM
-        # the moment streaming ends, but their parent has `opacity-0` +
-        # `group-hover:opacity-100`, so they are never `visible` without a
-        # mouse hover (and never in headless). DOM-presence is the real
-        # signal we want.
-        timeout_ms = self._settings.response_timeout_s * 1000
-        button = ChatGPTSelectors.turn_action_button(turn)
-        await button.wait_for(state="attached", timeout=timeout_ms)
-
-    async def _wait_for_text_stable(self, turn: Locator) -> None:
         timeout_s = self._settings.response_timeout_s
         stable_ms = self._settings.stream_stable_ms
         poll_ms = self._settings.stream_poll_ms
+        stop = ChatGPTSelectors.stop_button(page)
 
         deadline = time.monotonic() + timeout_s
-        previous: str | None = None
-        stable_since: float | None = None
+        text_changed = False
+        last_text: str = text_before_send
+        text_stable_since: float | None = None
+        stop_seen_present = False
+        stop_gone_since: float | None = None
 
         while time.monotonic() < deadline:
+            current = await self._last_assistant_text(page)
             try:
-                current = (await turn.inner_text()).strip()
+                stop_present = await stop.count() > 0
             except PlaywrightError:
-                # Turn may detach briefly during React re-renders.
-                current = ""
+                stop_present = True  # treat as "still streaming"
 
             now = time.monotonic()
-            if current != previous:
-                previous = current
-                stable_since = now
-            elif (
-                current
-                and stable_since is not None
-                and (now - stable_since) * 1000 >= stable_ms
-            ):
-                return
+
+            # --- text-stability signal -----------------------------------
+            if current != text_before_send:
+                text_changed = True
+            if text_changed:
+                if current != last_text:
+                    last_text = current
+                    text_stable_since = now
+                elif (
+                    current
+                    and text_stable_since is not None
+                    and (now - text_stable_since) * 1000 >= stable_ms
+                ):
+                    log.bind(signal="text_stable", text_len=len(current)).debug(
+                        "response_done"
+                    )
+                    return current
+
+            # --- stop-button-gone signal ---------------------------------
+            if stop_present:
+                stop_seen_present = True
+                stop_gone_since = None
+            elif stop_seen_present:
+                if stop_gone_since is None:
+                    stop_gone_since = now
+                elif (now - stop_gone_since) * 1000 >= stable_ms:
+                    final = await self._last_assistant_text(page)
+                    log.bind(signal="stop_gone", text_len=len(final)).debug(
+                        "response_done"
+                    )
+                    return final
 
             await asyncio.sleep(poll_ms / 1000)
 
-        raise PlaywrightTimeoutError("text never stabilized within timeout")
+        raise PlaywrightTimeoutError(
+            "no debounced end-of-stream signal fired within timeout"
+        )
+
+    async def _last_assistant_text(self, page: Page) -> str:
+        """Return innerText of the last [data-message-author-role=assistant]
+        element in document order, or "" if none/error.
+
+        Page-level rather than locator-anchored to avoid breaking when
+        ChatGPT lazy-mounts/unmounts older turns during interaction.
+        """
+        try:
+            return await page.evaluate(
+                "() => {"
+                "  const els = document.querySelectorAll("
+                "    '[data-message-author-role=\"assistant\"]'"
+                "  );"
+                "  if (!els.length) return '';"
+                "  return (els[els.length - 1].innerText || '').trim();"
+                "}"
+            )
+        except PlaywrightError:
+            return ""
 
     async def _ensure_on(
         self, page: Page, target: str, *, chat_url: str | None
