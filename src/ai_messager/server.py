@@ -6,9 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+import yaml
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+from pydantic import HttpUrl
 
 from ai_messager.bridges.base import LLMBridge
 from ai_messager.bridges.registry import BridgeRegistry
@@ -34,6 +36,25 @@ class MCPServer:
             },
         },
         "required": ["message"],
+        "additionalProperties": False,
+    }
+
+    SET_CHAT_URL_SCHEMA: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "endpoint_name": {
+                "type": "string",
+                "description": "Name of the endpoint to update (e.g. 'gpt_architect').",
+            },
+            "chat_url": {
+                "type": "string",
+                "description": (
+                    "New ChatGPT conversation URL to pin this endpoint to. "
+                    "Pass an empty string to clear (switch to fresh-chat mode)."
+                ),
+            },
+        },
+        "required": ["endpoint_name", "chat_url"],
         "additionalProperties": False,
     }
 
@@ -78,12 +99,26 @@ class MCPServer:
     def _wire_handlers(self) -> None:
         @self._server.list_tools()
         async def _list_tools() -> list[Tool]:
-            return [self._tool_for(ep) for ep in self._ordered_endpoints]
+            tools = [self._tool_for(ep) for ep in self._ordered_endpoints]
+            tools.append(
+                Tool(
+                    name="set_chat_url",
+                    description=(
+                        "Change the chat URL for an endpoint at runtime. "
+                        "Updates both the running server and config.yaml on disk. "
+                        "Pass empty string to clear (fresh-chat mode)."
+                    ),
+                    inputSchema=MCPServer.SET_CHAT_URL_SCHEMA,
+                )
+            )
+            return tools
 
         @self._server.call_tool()
         async def _call_tool(
             name: str, arguments: dict[str, Any] | None
         ) -> list[TextContent]:
+            if name == "set_chat_url":
+                return await self._handle_set_chat_url(arguments)
             return await self._handle_call(name, arguments)
 
     @staticmethod
@@ -157,6 +192,44 @@ class MCPServer:
             return [TextContent(type="text", text=payload)]
 
         return [TextContent(type="text", text=reply)]
+
+    async def _handle_set_chat_url(
+        self, arguments: dict[str, Any] | None
+    ) -> list[TextContent]:
+        args = arguments or {}
+        ep_name = args.get("endpoint_name", "")
+        chat_url_raw = args.get("chat_url", "")
+
+        ep = self._endpoints.get(ep_name)
+        if ep is None:
+            available = ", ".join(sorted(self._endpoints))
+            raise ValueError(f"Unknown endpoint: {ep_name!r}. Available: {available}")
+
+        new_url: HttpUrl | None = HttpUrl(chat_url_raw) if chat_url_raw else None
+
+        ep.chat_url = new_url
+
+        self._persist_config()
+
+        label = str(new_url) if new_url else "(fresh chat)"
+        log.bind(endpoint=ep_name, chat_url=label).info("chat_url updated")
+        return [TextContent(type="text", text=f"Endpoint '{ep_name}' → {label}")]
+
+    def _persist_config(self) -> None:
+        data: dict[str, Any] = {"endpoints": []}
+        for ep in self._ordered_endpoints:
+            entry: dict[str, Any] = {
+                "name": ep.name,
+                "provider": ep.provider,
+                "description": ep.description,
+            }
+            if ep.chat_url is not None:
+                entry["chat_url"] = str(ep.chat_url)
+            data["endpoints"].append(entry)
+        self._settings.config_path.write_text(
+            yaml.dump(data, default_flow_style=False, allow_unicode=True),
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _spill_reply(reply: str, *, tool: str, responses_dir: Path) -> Path:
